@@ -1,0 +1,19 @@
+{
+  "name": "star-platform-backend",
+  "version": "1.0.0",
+  "description": "STAR — System for Tracking and Automating Releases",
+  "main": "src/index.js",
+  "scripts": {
+    "dev": "nodemon src/index.js",
+    "dev:cluster": "nodemon src/master.js",
+    "start": "node src/master.js",
+    "start:single": "node src/index.js",
+    "seed": "node prisma/seed.js",
+    "db:migrate": "npx prisma migrate dev",
+    "db:reset": "npx prisma migrate reset",
+    "db:generate": "npx prisma generate",
+    "db:studio": "npx prisma studio"
+  },
+  "author": "Amine Lakhal",
+  "license": "ISC"
+}
