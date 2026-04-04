@@ -79,7 +79,7 @@ router.post('/webhook', authenticateWebhook, async (req, res) => {
         filesChanged: fetchedFiles,
         additions: totalAdditions,
         deletions: totalDeletions,
-        status: 'PENDING',
+        status: 'PENDING_APPROVAL',
       },
     });
 
@@ -88,9 +88,21 @@ router.post('/webhook', authenticateWebhook, async (req, res) => {
       version,
       commit: commit.slice(0, 7),
       author,
-    }, 'New release registered via webhook');
+    }, 'New release registered via webhook — awaiting approval');
 
-    res.status(201).json({ message: 'Release registered', release });
+    // Send approval notification email
+    try {
+      const { sendApprovalRequired } = require('../../modules/notifications/notifications.service');
+      const releaseWithProject = await prisma.release.findUnique({
+        where: { id: release.id },
+        include: { project: true },
+      });
+      await sendApprovalRequired({ release: releaseWithProject });
+    } catch (emailErr) {
+      log.warn({ error: emailErr.message }, 'Failed to send approval email');
+    }
+
+    res.status(201).json({ message: 'Release registered — awaiting approval', release });
   } catch (err) {
     log.error({ error: err.message }, 'Webhook processing failed');
     res.status(400).json({ error: err.message });

@@ -59,6 +59,7 @@ router.post('/trigger/:releaseId', async (req, res) => {
     }
 
     // Check if release is in a deployable state
+    // PENDING_APPROVAL requires approval first — cannot be deployed directly
     const deployableStatuses = ['PENDING', 'APPROVED', 'FAILED', 'ROLLED_BACK'];
     if (!deployableStatuses.includes(release.status)) {
       return res.status(400).json({
