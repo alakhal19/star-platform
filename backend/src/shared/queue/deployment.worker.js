@@ -3,6 +3,7 @@ const prisma = require('../database/prisma');
 const { createModuleLogger } = require('../logger/logger');
 const { createSnapshot } = require('../../modules/snapshots/snapshots.service');
 const { emitDeploymentEvent } = require('./events');
+const { sendDeploymentSuccess, sendDeploymentFailed } = require('../../modules/notifications/notifications.service');
 
 const log = createModuleLogger('deployment-worker');
 
@@ -255,6 +256,12 @@ const deploymentWorker = new Worker('deployments', async (job) => {
       duration,
     }, 'Deployment completed successfully');
 
+    // Send success email
+    const releaseWithProject = await prisma.release.findUnique({
+      where: { id: release.id },
+      include: { project: true },
+    });
+    await sendDeploymentSuccess({ release: releaseWithProject, deployment: await prisma.deployment.findUnique({ where: { id: deployment.id } }) });
     return {
       success: true,
       environment: targetEnv,
@@ -288,7 +295,12 @@ const deploymentWorker = new Worker('deployments', async (job) => {
       error: err.message,
       duration,
     }, 'Deployment failed');
-
+    // Send failure email
+    const releaseWithProject2 = await prisma.release.findUnique({
+      where: { id: release.id },
+      include: { project: true },
+    });
+    await sendDeploymentFailed({ release: releaseWithProject2, deployment: await prisma.deployment.findUnique({ where: { id: deployment.id } }), error: err.message });
     throw err;
   }
 }, {
