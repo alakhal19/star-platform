@@ -63,8 +63,8 @@ const createApp = () => {
 
   app.use('/api/deployments', require('./modules/deployments/deployments.router'));
   // TODO Phase 7: SSE endpoint for real-time deployment tracking
-  // TODO Phase 8: app.use('/api/snapshots', require('./modules/snapshots/snapshots.router'));
-  // TODO Phase 9: app.use('/api/scheduler', require('./modules/scheduler/scheduler.router'));
+  app.use('/api/snapshots', require('./modules/snapshots/snapshots.router'));
+  app.use('/api/scheduler', require('./modules/scheduler/scheduler.router'));
   // TODO Phase 13: app.use('/api/metrics', require('./modules/metrics/metrics.router'));
   // TODO Phase 15: app.use('/api/ai', require('./modules/ai/ai.router'));
 

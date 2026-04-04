@@ -1,6 +1,7 @@
 const { Worker } = require('bullmq');
 const prisma = require('../database/prisma');
 const { createModuleLogger } = require('../logger/logger');
+const { createSnapshot } = require('../../modules/snapshots/snapshots.service');
 const { emitDeploymentEvent } = require('./events');
 
 const log = createModuleLogger('deployment-worker');
@@ -52,6 +53,40 @@ const deploymentWorker = new Worker('deployments', async (job) => {
   const logs = [];
 
   try {
+    // ─── STEP 0: Create snapshot of current environment ─
+    const autoSnapshot = await prisma.systemConfig.findUnique({
+      where: { key: 'auto_snapshot' },
+    });
+
+    if (autoSnapshot?.value === 'true') {
+      emitDeploymentEvent({
+        type: 'step',
+        releaseId: release.id,
+        deploymentId: deployment.id,
+        version: release.version,
+        step: 'SNAPSHOT',
+        message: `Creating snapshot of current ${currentEnv} environment...`,
+        percent: 5,
+      });
+
+      const snapshot = await createSnapshot({
+        releaseId: release.id,
+        environment: currentEnv,
+      });
+
+      logs.push(`[${timestamp()}] Snapshot created: ${snapshot.backendTag}`);
+      logs.push(`[${timestamp()}] Snapshot created: ${snapshot.frontendTag}`);
+
+      emitDeploymentEvent({
+        type: 'step',
+        releaseId: release.id,
+        deploymentId: deployment.id,
+        version: release.version,
+        step: 'SNAPSHOT',
+        message: `Snapshot saved: ${snapshot.backendTag}`,
+        percent: 8,
+      });
+    }
     // ─── STEP 1: Pull images (20%) ──────────────────────
     await job.updateProgress({ step: 'PULLING_IMAGES', percent: 10 });
     await updateDeploymentStatus(deployment.id, 'PULLING_IMAGES');
