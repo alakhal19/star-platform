@@ -18,17 +18,11 @@ const getJwksClient = () => {
   return jwksClient;
 };
 
-// Get Keycloak public key for JWT verification
-const getKey = (header, callback) => {
-  const client = getJwksClient();
-  if (!client) {
-    return callback(new Error('JWKS client not configured'));
-  }
-  client.getSigningKey(header.kid, (err, key) => {
-    if (err) return callback(err);
-    const signingKey = key.getPublicKey();
-    callback(null, signingKey);
-  });
+// Check if Keycloak is configured and active
+const isKeycloakActive = () => {
+  return process.env.KEYCLOAK_URL &&
+    process.env.KEYCLOAK_CLIENT_SECRET &&
+    process.env.KEYCLOAK_CLIENT_SECRET !== 'change_me_later';
 };
 
 const authenticate = (req, res, next) => {
@@ -40,31 +34,54 @@ const authenticate = (req, res, next) => {
 
   const token = authHeader.split(' ')[1];
 
-  // If Keycloak is configured, validate against Keycloak JWKS
-  if (process.env.KEYCLOAK_URL && process.env.NODE_ENV === 'production') {
-    jwt.verify(token, getKey, {
-      algorithms: ['RS256'],
-      issuer: `${process.env.KEYCLOAK_URL}/realms/${process.env.KEYCLOAK_REALM}`,
-    }, (err, decoded) => {
+  // Check if it's a Keycloak token by decoding it first (without verifying)
+  const decoded = jwt.decode(token, { complete: true });
+
+  if (!decoded) {
+    return res.status(401).json({ error: 'Invalid token format' });
+  }
+
+  // If the token has a "kid" (key ID) header AND Keycloak is configured,
+  // it's a Keycloak token — validate with JWKS
+  if (decoded.header.kid && isKeycloakActive()) {
+    const client = getJwksClient();
+
+    if (!client) {
+      return res.status(401).json({ error: 'Keycloak not configured' });
+    }
+
+    client.getSigningKey(decoded.header.kid, (err, key) => {
       if (err) {
-        log.warn({ error: err.message }, 'Keycloak token validation failed');
+        log.warn({ error: err.message }, 'Failed to get Keycloak signing key');
         return res.status(401).json({ error: 'Invalid or expired token' });
       }
-      req.userId = decoded.sub;
-      req.userRole = decoded.realm_access?.roles || [];
-      req.userName = decoded.preferred_username || decoded.name;
-      next();
+
+      const signingKey = key.getPublicKey();
+
+      jwt.verify(token, signingKey, {
+        algorithms: ['RS256'],
+      }, (verifyErr, payload) => {
+        if (verifyErr) {
+          log.warn({ error: verifyErr.message }, 'Keycloak token verification failed');
+          return res.status(401).json({ error: 'Invalid or expired token' });
+        }
+
+        req.userId = payload.sub;
+        req.userRole = payload.realm_access?.roles || [];
+        req.userName = payload.preferred_username || payload.name || 'unknown';
+        next();
+      });
     });
   } else {
-    // Dev mode: validate against local JWT_SECRET
+    // No "kid" header — it's a local dev JWT, validate with JWT_SECRET
     try {
-      const decoded = jwt.verify(token, process.env.JWT_SECRET);
-      req.userId = decoded.userId;
-      req.userRole = decoded.role;
-      req.userName = decoded.username || 'admin';
+      const payload = jwt.verify(token, process.env.JWT_SECRET);
+      req.userId = payload.userId;
+      req.userRole = payload.role;
+      req.userName = payload.username || 'admin';
       next();
     } catch (err) {
-      log.warn({ error: err.message }, 'Local token validation failed');
+      log.warn({ error: err.message }, 'Local token verification failed');
       return res.status(401).json({ error: 'Invalid or expired token' });
     }
   }
