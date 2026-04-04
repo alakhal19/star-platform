@@ -4,6 +4,7 @@ const { createModuleLogger } = require('../logger/logger');
 const { createSnapshot } = require('../../modules/snapshots/snapshots.service');
 const { emitDeploymentEvent } = require('./events');
 const { sendDeploymentSuccess, sendDeploymentFailed } = require('../../modules/notifications/notifications.service');
+const { checkHealth } = require('../ssh/healthcheck');
 
 const log = createModuleLogger('deployment-worker');
 
@@ -169,8 +170,48 @@ const deploymentWorker = new Worker('deployments', async (job) => {
       percent: 60,
     });
 
-    await sleep(2000);
-    logs.push(`[${timestamp()}] Health check passed: 200 OK`);
+    // Determine the health check URL based on environment
+    // TODO: When connected to VM2, use real ports (BLUE=5001, GREEN=5002)
+    // For now, simulate the health check
+    const isSimulated = !process.env.VM2_HEALTH_URL;
+
+    let healthResult;
+    if (isSimulated) {
+      // Simulated health check (always passes for local testing)
+      await sleep(2000);
+      healthResult = { healthy: true, status: 200, attempt: 1 };
+      logs.push(`[${timestamp()}] Health check passed: 200 OK (simulated)`);
+    } else {
+      // Real health check against VM2
+      const backendPort = targetEnv === 'BLUE' ? 5001 : 5002;
+      const healthUrl = `http://${process.env.VM2_HOST}:${backendPort}/`;
+      healthResult = await checkHealth(healthUrl, {
+        retries: 3,
+        timeout: 5000,
+        delay: 3000,
+      });
+
+      if (healthResult.healthy) {
+        logs.push(`[${timestamp()}] Health check passed: ${healthResult.status} OK (attempt ${healthResult.attempt})`);
+      } else {
+        logs.push(`[${timestamp()}] Health check FAILED after ${healthResult.attempt} attempts`);
+      }
+    }
+
+    // If health check fails, abort the deployment
+    if (!healthResult.healthy) {
+      emitDeploymentEvent({
+        type: 'error',
+        releaseId: release.id,
+        deploymentId: deployment.id,
+        version: release.version,
+        step: 'HEALTH_CHECKING',
+        message: `Health check FAILED — deployment aborted. Traffic stays on ${currentEnv}.`,
+        percent: 65,
+      });
+
+      throw new Error(`Health check failed on ${targetEnv} environment — containers may have crashed on startup`);
+    }
 
     await job.updateProgress({ step: 'HEALTH_CHECKING', percent: 70 });
 
@@ -180,7 +221,7 @@ const deploymentWorker = new Worker('deployments', async (job) => {
       deploymentId: deployment.id,
       version: release.version,
       step: 'HEALTH_CHECKING',
-      message: 'Health check passed: 200 OK',
+      message: `Health check passed: ${healthResult.status} OK`,
       percent: 70,
     });
 
