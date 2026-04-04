@@ -1,10 +1,58 @@
 const pino = require('pino');
 const path = require('path');
+const fs = require('fs');
 
 const isDev = process.env.NODE_ENV !== 'production';
 
-// In development: pretty print to console
-// In production: structured JSON to stdout (Filebeat picks it up)
+// In production, ensure log directory exists
+const LOG_DIR = process.env.LOG_DIR || '/var/log/star';
+if (!isDev) {
+  try {
+    fs.mkdirSync(LOG_DIR, { recursive: true });
+  } catch (err) {
+    // Directory might already exist or we don't have permission (handled by systemd)
+  }
+}
+
+// Build the transport configuration
+const getTransport = () => {
+  if (isDev) {
+    // Development: pretty print to console
+    return {
+      target: 'pino-pretty',
+      options: {
+        colorize: true,
+        translateTime: 'HH:MM:ss',
+        ignore: 'pid,hostname,service,worker',
+      },
+    };
+  }
+
+  // Production: write structured JSON to multiple files
+  return {
+    targets: [
+      // Main log file — everything
+      {
+        target: 'pino/file',
+        options: { destination: path.join(LOG_DIR, 'service.log') },
+        level: 'info',
+      },
+      // Error log file — errors only
+      {
+        target: 'pino/file',
+        options: { destination: path.join(LOG_DIR, 'error.log') },
+        level: 'error',
+      },
+      // Also output to stdout for journald (systemd captures this)
+      {
+        target: 'pino/file',
+        options: { destination: 1 },
+        level: 'info',
+      },
+    ],
+  };
+};
+
 const logger = pino({
   level: process.env.LOG_LEVEL || 'info',
 
@@ -18,17 +66,8 @@ const logger = pino({
   // ISO timestamp for ELK parsing
   timestamp: pino.stdTimeFunctions.isoTime,
 
-  // Pretty print in dev only
-  transport: isDev
-    ? {
-        target: 'pino-pretty',
-        options: {
-          colorize: true,
-          translateTime: 'HH:MM:ss',
-          ignore: 'pid,hostname,service,worker',
-        },
-      }
-    : undefined,
+  // Transport (dev = pretty, prod = files)
+  transport: getTransport(),
 
   // Structured serializers for consistent field names
   serializers: {

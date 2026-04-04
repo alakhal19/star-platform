@@ -1,0 +1,47 @@
+[Unit]
+Description=STAR — System for Tracking and Automating Releases
+Documentation=https://github.com/your_username/star-platform
+After=network.target postgresql.service redis.service
+Wants=postgresql.service redis.service
+
+[Service]
+Type=simple
+User=star
+Group=star
+WorkingDirectory=/opt/star/backend
+ExecStart=/usr/bin/node src/master.js
+ExecReload=/bin/kill -HUP $MAINPID
+
+# Environment
+Environment=NODE_ENV=production
+EnvironmentFile=/opt/star/backend/.env
+
+# Restart policy
+Restart=always
+RestartSec=5
+StartLimitInterval=60
+StartLimitBurst=5
+
+# Process management
+KillMode=control-group
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+# Logging (stdout/stderr to journald → Filebeat picks up)
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=star
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/star /var/log/star /var/run/star /var/lib/star
+PrivateTmp=true
+
+# Resource limits
+LimitNOFILE=65536
+LimitNPROC=4096
+
+[Install]
+WantedBy=multi-user.target
