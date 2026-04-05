@@ -1,8 +1,13 @@
 const express = require('express');
 const { authenticate } = require('../../shared/middleware/auth.middleware');
-const aiService = require('./ai.service');
 const prisma = require('../../shared/database/prisma');
 const { createModuleLogger } = require('../../shared/logger/logger');
+
+// Choose AI provider based on .env config
+const aiProvider = process.env.AI_PROVIDER || 'anthropic';
+const aiService = aiProvider === 'azure'
+  ? require('./azure-ai.service')
+  : require('./ai.service');
 
 const router = express.Router();
 const log = createModuleLogger('ai');
