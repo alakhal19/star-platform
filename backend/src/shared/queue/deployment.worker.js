@@ -1,10 +1,10 @@
 const { Worker } = require('bullmq');
 const prisma = require('../database/prisma');
 const { createModuleLogger } = require('../logger/logger');
-const { createSnapshot } = require('../../modules/snapshots/snapshots.service');
 const { emitDeploymentEvent } = require('./events');
 const { sendDeploymentSuccess, sendDeploymentFailed } = require('../../modules/notifications/notifications.service');
 const { checkHealth } = require('../ssh/healthcheck');
+const { ensureNamespace, upsertImagePullSecret, upsertDeployment, upsertService, upsertIngress, waitForDeploymentReady } = require('../k8s/k8s.client');
 
 const log = createModuleLogger('deployment-worker');
 
@@ -55,270 +55,246 @@ const deploymentWorker = new Worker('deployments', async (job) => {
   const logs = [];
 
   try {
-    // ─── STEP 0: Create snapshot of current environment ─
-    const autoSnapshot = await prisma.systemConfig.findUnique({
-      where: { key: 'auto_snapshot' },
-    });
+    const namespace = process.env.K8S_NAMESPACE || 'erp';
+    const ingressClass = process.env.K8S_INGRESS_CLASS || 'nginx';
+    const ingressHost = process.env.K8S_INGRESS_HOST || 'localhost';
+    const imagePullSecretName = process.env.K8S_IMAGE_PULL_SECRET_NAME || 'ghcr-image-pull';
+    const backendPort = 5000;
+    const frontendPort = 3000;
+    const backendName = `erp-backend-${targetEnv.toLowerCase()}`;
+    const frontendName = `erp-frontend-${targetEnv.toLowerCase()}`;
+    const backendLabels = { app: 'erp-backend', env: targetEnv.toLowerCase(), release: release.version };
+    const frontendLabels = { app: 'erp-frontend', env: targetEnv.toLowerCase(), release: release.version };
 
-    if (autoSnapshot?.value === 'true') {
-      emitDeploymentEvent({
-        type: 'step',
-        releaseId: release.id,
-        deploymentId: deployment.id,
-        version: release.version,
-        step: 'SNAPSHOT',
-        message: `Creating snapshot of current ${currentEnv} environment...`,
-        percent: 5,
+    if (process.env.GHCR_USERNAME && process.env.GHCR_TOKEN) {
+      await upsertImagePullSecret({
+        namespace,
+        name: imagePullSecretName,
+        server: 'ghcr.io',
+        username: process.env.GHCR_USERNAME,
+        password: process.env.GHCR_TOKEN,
       });
-
-      const snapshot = await createSnapshot({
-        releaseId: release.id,
-        environment: currentEnv,
-      });
-
-      logs.push(`[${timestamp()}] Snapshot created: ${snapshot.backendTag}`);
-      logs.push(`[${timestamp()}] Snapshot created: ${snapshot.frontendTag}`);
-
-      emitDeploymentEvent({
-        type: 'step',
-        releaseId: release.id,
-        deploymentId: deployment.id,
-        version: release.version,
-        step: 'SNAPSHOT',
-        message: `Snapshot saved: ${snapshot.backendTag}`,
-        percent: 8,
-      });
-    }
-    // ─── STEP 1: Pull images (20%) ──────────────────────
-    await job.updateProgress({ step: 'PULLING_IMAGES', percent: 10 });
-    await updateDeploymentStatus(deployment.id, 'PULLING_IMAGES');
-    logs.push(`[${timestamp()}] Pulling backend image: ${release.backendImage}`);
-
-    emitDeploymentEvent({
-      type: 'step',
-      releaseId: release.id,
-      deploymentId: deployment.id,
-      version: release.version,
-      step: 'PULLING_IMAGES',
-      message: `Pulling backend image: ${release.backendImage}`,
-      percent: 10,
-    });
-
-    await sleep(2000);
-    logs.push(`[${timestamp()}] Backend image pulled successfully`);
-
-    await job.updateProgress({ step: 'PULLING_IMAGES', percent: 20 });
-    logs.push(`[${timestamp()}] Pulling frontend image: ${release.frontendImage}`);
-
-    emitDeploymentEvent({
-      type: 'step',
-      releaseId: release.id,
-      deploymentId: deployment.id,
-      version: release.version,
-      step: 'PULLING_IMAGES',
-      message: `Pulling frontend image: ${release.frontendImage}`,
-      percent: 20,
-    });
-
-    await sleep(2000);
-    logs.push(`[${timestamp()}] Frontend image pulled successfully`);
-
-    // ─── STEP 2: Start containers (50%) ─────────────────
-    await job.updateProgress({ step: 'STARTING_CONTAINERS', percent: 40 });
-    await updateDeploymentStatus(deployment.id, 'STARTING_CONTAINERS');
-    logs.push(`[${timestamp()}] Starting ${targetEnv} containers...`);
-
-    emitDeploymentEvent({
-      type: 'step',
-      releaseId: release.id,
-      deploymentId: deployment.id,
-      version: release.version,
-      step: 'STARTING_CONTAINERS',
-      message: `Starting ${targetEnv} containers...`,
-      percent: 40,
-    });
-
-    await sleep(2000);
-    logs.push(`[${timestamp()}] Backend container started on ${targetEnv}`);
-
-    await job.updateProgress({ step: 'STARTING_CONTAINERS', percent: 50 });
-    await sleep(1000);
-    logs.push(`[${timestamp()}] Frontend container started on ${targetEnv}`);
-
-    emitDeploymentEvent({
-      type: 'step',
-      releaseId: release.id,
-      deploymentId: deployment.id,
-      version: release.version,
-      step: 'STARTING_CONTAINERS',
-      message: `All containers running on ${targetEnv}`,
-      percent: 50,
-    });
-
-    // ─── STEP 3: Health check (70%) ─────────────────────
-    await job.updateProgress({ step: 'HEALTH_CHECKING', percent: 60 });
-    await updateDeploymentStatus(deployment.id, 'HEALTH_CHECKING');
-    logs.push(`[${timestamp()}] Running health check on ${targetEnv}...`);
-
-    emitDeploymentEvent({
-      type: 'step',
-      releaseId: release.id,
-      deploymentId: deployment.id,
-      version: release.version,
-      step: 'HEALTH_CHECKING',
-      message: `Running health check on ${targetEnv}...`,
-      percent: 60,
-    });
-
-    // Determine the health check URL based on environment
-    // TODO: When connected to VM2, use real ports (BLUE=5001, GREEN=5002)
-    // For now, simulate the health check
-    const isSimulated = !process.env.VM2_HEALTH_URL;
-
-    let healthResult;
-    if (isSimulated) {
-      // Simulated health check (always passes for local testing)
-      await sleep(2000);
-      healthResult = { healthy: true, status: 200, attempt: 1 };
-      logs.push(`[${timestamp()}] Health check passed: 200 OK (simulated)`);
-    } else {
-      // Real health check against VM2
-      const backendPort = targetEnv === 'BLUE' ? 5001 : 5002;
-      const healthUrl = `http://${process.env.VM2_HOST}:${backendPort}/`;
-      healthResult = await checkHealth(healthUrl, {
-        retries: 3,
-        timeout: 5000,
-        delay: 3000,
-      });
-
-      if (healthResult.healthy) {
-        logs.push(`[${timestamp()}] Health check passed: ${healthResult.status} OK (attempt ${healthResult.attempt})`);
-      } else {
-        logs.push(`[${timestamp()}] Health check FAILED after ${healthResult.attempt} attempts`);
-      }
+      logs.push(`[${timestamp()}] Image pull secret ${imagePullSecretName} ensured in namespace ${namespace}`);
     }
 
-    // If health check fails, abort the deployment
-    if (!healthResult.healthy) {
-      emitDeploymentEvent({
-        type: 'error',
-        releaseId: release.id,
-        deploymentId: deployment.id,
-        version: release.version,
-        step: 'HEALTH_CHECKING',
-        message: `Health check FAILED — deployment aborted. Traffic stays on ${currentEnv}.`,
-        percent: 65,
-      });
-
-      throw new Error(`Health check failed on ${targetEnv} environment — containers may have crashed on startup`);
-    }
-
-    await job.updateProgress({ step: 'HEALTH_CHECKING', percent: 70 });
-
     emitDeploymentEvent({
       type: 'step',
       releaseId: release.id,
       deploymentId: deployment.id,
       version: release.version,
-      step: 'HEALTH_CHECKING',
-      message: `Health check passed: ${healthResult.status} OK`,
-      percent: 70,
+      step: 'K8S_SETUP',
+      message: `Preparing Kubernetes deployment in namespace ${namespace}...`,
+      percent: 5,
     });
 
-    // ─── STEP 4: Switch traffic (90%) ───────────────────
-    await job.updateProgress({ step: 'SWITCHING_TRAFFIC', percent: 80 });
-    await updateDeploymentStatus(deployment.id, 'SWITCHING_TRAFFIC');
-    logs.push(`[${timestamp()}] Switching Nginx traffic to ${targetEnv}...`);
+  await ensureNamespace(namespace);
 
-    emitDeploymentEvent({
-      type: 'step',
-      releaseId: release.id,
-      deploymentId: deployment.id,
-      version: release.version,
-      step: 'SWITCHING_TRAFFIC',
-      message: `Switching traffic to ${targetEnv}...`,
-      percent: 80,
-    });
+  logs.push(`[${timestamp()}] Ensured namespace ${namespace}`);
+  await job.updateProgress({ step: 'K8S_SETUP', percent: 10 });
 
-    await sleep(1000);
-    logs.push(`[${timestamp()}] Traffic switched to ${targetEnv}`);
+  await upsertDeployment({
+    namespace,
+    name: backendName,
+    image: release.backendImage,
+    containerPort: backendPort,
+    labels: backendLabels,
+    env: [
+      { name: 'PORT', value: `${backendPort}` },
+      { name: 'NODE_ENV', value: 'production' },
+    ],
+    imagePullSecrets: process.env.GHCR_USERNAME && process.env.GHCR_TOKEN ? [{ name: imagePullSecretName }] : [],
+  });
 
-    await job.updateProgress({ step: 'SWITCHING_TRAFFIC', percent: 90 });
+  logs.push(`[${timestamp()}] Backend deployment ${backendName} applied`);
+  await upsertService({
+    namespace,
+    name: backendName,
+    selector: backendLabels,
+    port: backendPort,
+    targetPort: backendPort,
+  });
 
-    // ─── STEP 5: Finalize (100%) ────────────────────────
-    const duration = Date.now() - startTime;
+  logs.push(`[${timestamp()}] Backend service ${backendName} created`);
 
-    // Update active environment in config
-    await prisma.systemConfig.upsert({
-      where: { key: 'active_environment' },
-      update: { value: targetEnv },
-      create: { key: 'active_environment', value: targetEnv },
-    });
+  await upsertDeployment({
+    namespace,
+    name: frontendName,
+    image: release.frontendImage,
+    containerPort: frontendPort,
+    labels: frontendLabels,
+    env: [
+      { name: 'NODE_ENV', value: 'production' },
+      { name: 'BACKEND_URL', value: `http://${backendName}:${backendPort}` },
+    ],
+    imagePullSecrets: process.env.GHCR_USERNAME && process.env.GHCR_TOKEN ? [{ name: imagePullSecretName }] : [],
+  });
 
-    // Mark deployment as successful
-    await prisma.deployment.update({
-      where: { id: deployment.id },
-      data: {
-        status: 'SUCCESS',
-        logs: logs.join('\n'),
-        duration,
-        healthCheckOk: true,
-        completedAt: new Date(),
-      },
-    });
+  logs.push(`[${timestamp()}] Frontend deployment ${frontendName} applied`);
+  await upsertService({
+    namespace,
+    name: frontendName,
+    selector: frontendLabels,
+    port: frontendPort,
+    targetPort: frontendPort,
+  });
 
-    // Mark release as deployed
-    await prisma.release.update({
-      where: { id: release.id },
-      data: { status: 'DEPLOYED' },
-    });
+  logs.push(`[${timestamp()}] Frontend service ${frontendName} created`);
 
-    // Mark scheduled deployment executed if present
-    try {
-      await prisma.scheduledDeployment.updateMany({
-        where: { releaseId: release.id, jobId: job.id },
-        data: { executed: true },
-      });
-    } catch (e) {
-      log.warn({ error: e.message }, 'Failed to mark scheduled deployment executed');
-    }
+  await upsertIngress({
+    namespace,
+    name: 'erp-ingress',
+    ingressClassName: ingressClass,
+    annotations: {
+      'nginx.ingress.kubernetes.io/rewrite-target': '/$1',
+    },
+    rules: [
+      { path: '/api', serviceName: backendName, servicePort: backendPort },
+      { path: '/', serviceName: frontendName, servicePort: frontendPort },
+    ],
+  });
 
-    logs.push(`[${timestamp()}] Deployment complete! Version ${release.version} is LIVE on ${targetEnv}`);
-    logs.push(`[${timestamp()}] Duration: ${(duration / 1000).toFixed(1)}s`);
+  logs.push(`[${timestamp()}] Ingress erp-ingress updated to route traffic to ${targetEnv}`);
 
-    await job.updateProgress({ step: 'COMPLETE', percent: 100 });
+  emitDeploymentEvent({
+    type: 'step',
+    releaseId: release.id,
+    deploymentId: deployment.id,
+    version: release.version,
+    step: 'K8S_DEPLOY',
+    message: `Applied Kubernetes deployment for ${targetEnv}`,
+    percent: 40,
+  });
 
-    emitDeploymentEvent({
-      type: 'complete',
-      releaseId: release.id,
-      deploymentId: deployment.id,
-      version: release.version,
-      step: 'COMPLETE',
-      message: `Version ${release.version} is LIVE on ${targetEnv} (${(duration / 1000).toFixed(1)}s)`,
-      percent: 100,
-      environment: targetEnv,
-      duration,
-    });
+  await job.updateProgress({ step: 'K8S_DEPLOY', percent: 40 });
 
-    log.info({
-      releaseId: release.id,
-      version: release.version,
-      environment: targetEnv,
-      duration,
-    }, 'Deployment completed successfully');
+  await waitForDeploymentReady({ namespace, name: backendName, replicas: 1, timeoutMs: 120000 });
+  logs.push(`[${timestamp()}] Backend deployment ${backendName} is ready`);
 
-    // Send success email
-    const releaseWithProject = await prisma.release.findUnique({
-      where: { id: release.id },
-      include: { project: true },
-    });
-    await sendDeploymentSuccess({ release: releaseWithProject, deployment: await prisma.deployment.findUnique({ where: { id: deployment.id } }) });
-    return {
-      success: true,
-      environment: targetEnv,
-      duration,
+  await waitForDeploymentReady({ namespace, name: frontendName, replicas: 1, timeoutMs: 120000 });
+  logs.push(`[${timestamp()}] Frontend deployment ${frontendName} is ready`);
+
+  await job.updateProgress({ step: 'K8S_DEPLOY', percent: 55 });
+
+  emitDeploymentEvent({
+    type: 'step',
+    releaseId: release.id,
+    deploymentId: deployment.id,
+    version: release.version,
+    step: 'K8S_HEALTH',
+    message: `Kubernetes workloads are ready for ${targetEnv}`,
+    percent: 60,
+  });
+
+  await job.updateProgress({ step: 'K8S_HEALTH', percent: 60 });
+
+  const healthResult = await checkHealth(`http://${ingressHost}/api/health`, {
+    retries: 3,
+    timeout: 5000,
+    delay: 3000,
+  });
+
+  if (!healthResult.healthy) {
+    logs.push(`[${timestamp()}] Health check failed for ingress route`);
+    throw new Error(`Health check failed on ingress route for ${targetEnv}`);
+  }
+
+  logs.push(`[${timestamp()}] Health check passed via ingress: ${healthResult.status}`);
+  await job.updateProgress({ step: 'K8S_HEALTH', percent: 70 });
+
+  // ─── STEP 4: Switch traffic (90%) ───────────────────
+  await job.updateProgress({ step: 'SWITCHING_TRAFFIC', percent: 80 });
+  await updateDeploymentStatus(deployment.id, 'SWITCHING_TRAFFIC');
+  logs.push(`[${timestamp()}] Switching Nginx traffic to ${targetEnv}...`);
+
+  emitDeploymentEvent({
+    type: 'step',
+    releaseId: release.id,
+    deploymentId: deployment.id,
+    version: release.version,
+    step: 'SWITCHING_TRAFFIC',
+    message: `Switching traffic to ${targetEnv}...`,
+    percent: 80,
+  });
+
+  await sleep(1000);
+  logs.push(`[${timestamp()}] Traffic switched to ${targetEnv}`);
+
+  await job.updateProgress({ step: 'SWITCHING_TRAFFIC', percent: 90 });
+
+  // ─── STEP 5: Finalize (100%) ────────────────────────
+  const duration = Date.now() - startTime;
+
+  // Update active environment in config
+  await prisma.systemConfig.upsert({
+    where: { key: 'active_environment' },
+    update: { value: targetEnv },
+    create: { key: 'active_environment', value: targetEnv },
+  });
+
+  // Mark deployment as successful
+  await prisma.deployment.update({
+    where: { id: deployment.id },
+    data: {
+      status: 'SUCCESS',
       logs: logs.join('\n'),
-    };
+      duration,
+      healthCheckOk: true,
+      completedAt: new Date(),
+    },
+  });
+
+  // Mark release as deployed
+  await prisma.release.update({
+    where: { id: release.id },
+    data: { status: 'DEPLOYED' },
+  });
+
+  // Mark scheduled deployment executed if present
+  try {
+    await prisma.scheduledDeployment.updateMany({
+      where: { releaseId: release.id, jobId: job.id },
+      data: { executed: true },
+    });
+  } catch (e) {
+    log.warn({ error: e.message }, 'Failed to mark scheduled deployment executed');
+  }
+
+  logs.push(`[${timestamp()}] Deployment complete! Version ${release.version} is LIVE on ${targetEnv}`);
+  logs.push(`[${timestamp()}] Duration: ${(duration / 1000).toFixed(1)}s`);
+
+  await job.updateProgress({ step: 'COMPLETE', percent: 100 });
+
+  emitDeploymentEvent({
+    type: 'complete',
+    releaseId: release.id,
+    deploymentId: deployment.id,
+    version: release.version,
+    step: 'COMPLETE',
+    message: `Version ${release.version} is LIVE on ${targetEnv} (${(duration / 1000).toFixed(1)}s)`,
+    percent: 100,
+    environment: targetEnv,
+    duration,
+  });
+
+  log.info({
+    releaseId: release.id,
+    version: release.version,
+    environment: targetEnv,
+    duration,
+  }, 'Deployment completed successfully');
+
+  // Send success email
+  const releaseWithProject = await prisma.release.findUnique({
+    where: { id: release.id },
+    include: { project: true },
+  });
+  await sendDeploymentSuccess({ release: releaseWithProject, deployment: await prisma.deployment.findUnique({ where: { id: deployment.id } }) });
+  return {
+    success: true,
+    environment: targetEnv,
+    duration,
+    logs: logs.join('\n'),
+  };
   } catch (err) {
     // ─── DEPLOYMENT FAILED ──────────────────────────────
     const duration = Date.now() - startTime;
