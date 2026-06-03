@@ -19,6 +19,10 @@ export default function DashboardPage() {
   const [releases, setReleases] = useState([]);
   const [loading, setLoading] = useState(true);
   const [events, setEvents] = useState([]);
+  const [showScheduleModal, setShowScheduleModal] = useState(false);
+  const [scheduledRelease, setScheduledRelease] = useState(null);
+  const [scheduledLocal, setScheduledLocal] = useState('');
+  const [scheduleReason, setScheduleReason] = useState('');
 
   useEffect(() => {
     fetchReleases();
@@ -76,6 +80,39 @@ export default function DashboardPage() {
       fetchReleases();
     } catch (err) {
       alert(err.response?.data?.error || 'Approval failed');
+    }
+  };
+
+  const openSchedule = (release) => {
+    setScheduledRelease(release);
+    // Pre-fill with 1 hour in future
+    const d = new Date(Date.now() + 60 * 60 * 1000);
+    const pad = (n) => n.toString().padStart(2, '0');
+    const local = `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+    setScheduledLocal(local);
+    setScheduleReason('');
+    setShowScheduleModal(true);
+  };
+
+  const handleScheduleSubmit = async () => {
+    if (!scheduledLocal) return alert('Select date and time');
+    const iso = new Date(scheduledLocal).toISOString();
+    try {
+      await api.post(`/releases/${scheduledRelease.id}/schedule`, { scheduledFor: iso, timezone: Intl.DateTimeFormat().resolvedOptions().timeZone, reason: scheduleReason });
+      setShowScheduleModal(false);
+      fetchReleases();
+    } catch (err) {
+      alert(err.response?.data?.error || 'Failed to schedule');
+    }
+  };
+
+  const handleCancelSchedule = async (releaseId) => {
+    if (!confirm('Cancel scheduled deployment?')) return;
+    try {
+      await api.post(`/releases/${releaseId}/schedule/cancel`);
+      fetchReleases();
+    } catch (err) {
+      alert(err.response?.data?.error || 'Failed to cancel schedule');
     }
   };
 
@@ -171,6 +208,9 @@ export default function DashboardPage() {
                     <span className={`w-1.5 h-1.5 rounded-full ${status.dot}`} />
                     {release.status === 'DEPLOYED' ? 'LIVE' : release.status.replace('_', ' ')}
                   </span>
+                  {release.status === 'SCHEDULED' && release.scheduledDeploy && (
+                    <div className="text-[10px] text-amber-300 mt-1">Scheduled: {new Date(release.scheduledDeploy.scheduledFor).toLocaleString()}</div>
+                  )}
                 </div>
                 <div className="text-[11px] text-gray-600">{timeAgo(release.createdAt)}</div>
                 <div className="flex items-center gap-2">
@@ -190,6 +230,22 @@ export default function DashboardPage() {
                       Deploy
                     </button>
                   )}
+                  {['APPROVED', 'PENDING', 'FAILED', 'ROLLED_BACK'].includes(release.status) && (
+                    <button
+                      onClick={() => openSchedule(release)}
+                      className="text-[10px] font-medium px-2.5 py-1 rounded bg-amber-500/10 text-amber-400 border border-amber-500/20 hover:bg-amber-500/20 transition-colors"
+                    >
+                      Schedule
+                    </button>
+                  )}
+                  {release.status === 'SCHEDULED' && release.scheduledDeploy && (
+                    <button
+                      onClick={() => handleCancelSchedule(release.id)}
+                      className="text-[10px] font-medium px-2.5 py-1 rounded bg-red-500/10 text-red-400 border border-red-500/20 hover:bg-red-500/20 transition-colors"
+                    >
+                      Cancel
+                    </button>
+                  )}
                   <Link
                     href={`/dashboard/${release.id}`}
                     className="text-[10px] font-medium px-2.5 py-1 rounded bg-blue-500/10 text-blue-400 border border-blue-500/20 hover:bg-blue-500/20 transition-colors"
@@ -202,6 +258,27 @@ export default function DashboardPage() {
           })
         )}
       </div>
+
+      {/* Schedule modal */}
+      {showScheduleModal && (
+        <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50">
+          <div className="bg-[#0f1423] rounded-xl p-6 w-[420px] border border-gray-800/20">
+            <h3 className="text-sm font-semibold text-gray-100 mb-3">Schedule deployment for {scheduledRelease?.version}</h3>
+            <div className="mb-3">
+              <label className="text-[11px] text-gray-400">Date & time</label>
+              <input type="datetime-local" value={scheduledLocal} onChange={(e) => setScheduledLocal(e.target.value)} className="w-full mt-1 p-2 rounded bg-gray-900 text-gray-100" />
+            </div>
+            <div className="mb-4">
+              <label className="text-[11px] text-gray-400">Reason (optional)</label>
+              <input value={scheduleReason} onChange={(e) => setScheduleReason(e.target.value)} className="w-full mt-1 p-2 rounded bg-gray-900 text-gray-100" />
+            </div>
+            <div className="flex justify-end gap-2">
+              <button onClick={() => setShowScheduleModal(false)} className="text-xs px-3 py-1 rounded bg-gray-800 text-gray-300">Cancel</button>
+              <button onClick={handleScheduleSubmit} className="text-xs px-3 py-1 rounded bg-amber-500 text-amber-900">Schedule</button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Live feed */}
       <div className="mb-4 flex items-center justify-between">

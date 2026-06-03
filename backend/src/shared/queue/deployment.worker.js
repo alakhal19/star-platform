@@ -273,6 +273,16 @@ const deploymentWorker = new Worker('deployments', async (job) => {
       data: { status: 'DEPLOYED' },
     });
 
+    // Mark scheduled deployment executed if present
+    try {
+      await prisma.scheduledDeployment.updateMany({
+        where: { releaseId: release.id, jobId: job.id },
+        data: { executed: true },
+      });
+    } catch (e) {
+      log.warn({ error: e.message }, 'Failed to mark scheduled deployment executed');
+    }
+
     logs.push(`[${timestamp()}] Deployment complete! Version ${release.version} is LIVE on ${targetEnv}`);
     logs.push(`[${timestamp()}] Duration: ${(duration / 1000).toFixed(1)}s`);
 
@@ -329,6 +339,16 @@ const deploymentWorker = new Worker('deployments', async (job) => {
       where: { id: release.id },
       data: { status: 'FAILED' },
     });
+
+    // Mark scheduled deployment executed even on failure
+    try {
+      await prisma.scheduledDeployment.updateMany({
+        where: { releaseId: release.id, jobId: job.id },
+        data: { executed: true },
+      });
+    } catch (e) {
+      log.warn({ error: e.message }, 'Failed to mark scheduled deployment executed after failure');
+    }
 
     log.error({
       releaseId: release.id,

@@ -2,6 +2,7 @@ const express = require('express');
 const prisma = require('../../shared/database/prisma');
 const { authenticate, authenticateWebhook } = require('../../shared/middleware/auth.middleware');
 const { createModuleLogger } = require('../../shared/logger/logger');
+const { deploymentQueue } = require('../../shared/queue/queue');
 
 const router = express.Router();
 const log = createModuleLogger('releases');
@@ -386,6 +387,98 @@ router.get('/:id/compare', async (req, res) => {
   } catch (err) {
     log.error({ error: err.message }, 'Failed to compare releases');
     res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/releases/:id/schedule — schedule a release for future deployment
+router.post('/:id/schedule', async (req, res) => {
+  try {
+    const { scheduledFor, timezone, reason } = req.body;
+
+    if (!scheduledFor) return res.status(400).json({ error: 'scheduledFor is required' });
+
+    const when = new Date(scheduledFor);
+    if (isNaN(when.getTime())) return res.status(400).json({ error: 'Invalid scheduledFor' });
+    if (when <= new Date()) return res.status(400).json({ error: 'scheduledFor must be in the future' });
+
+    const release = await prisma.release.findUnique({ where: { id: req.params.id } });
+    if (!release) return res.status(404).json({ error: 'Release not found' });
+
+    // Prevent double-scheduling for an already pending schedule
+    const existing = await prisma.scheduledDeployment.findUnique({ where: { releaseId: release.id } });
+    if (existing && !existing.cancelledAt && !existing.executed) {
+      return res.status(400).json({ error: 'Release already scheduled' });
+    }
+
+    // Create or refresh a scheduled deployment record if a previous schedule exists
+    const scheduled = await prisma.scheduledDeployment.upsert({
+      where: { releaseId: release.id },
+      create: {
+        releaseId: release.id,
+        scheduledFor: when,
+        timezone: timezone || 'UTC',
+        reason: reason || null,
+      },
+      update: {
+        scheduledFor: when,
+        timezone: timezone || 'UTC',
+        reason: reason || null,
+        jobId: null,
+        executed: false,
+        cancelledAt: null,
+      },
+    });
+
+    // Add delayed job to deployment queue
+    const delay = when.getTime() - Date.now();
+
+    const job = await deploymentQueue.add(
+      `scheduled-deploy-${release.version}`,
+      { releaseId: release.id, triggeredBy: req.userName || req.userId || 'system', scheduled: true },
+      { delay, jobId: `scheduled-${release.id}-${Date.now()}` }
+    );
+
+    // Store jobId on scheduled record
+    await prisma.scheduledDeployment.update({ where: { id: scheduled.id }, data: { jobId: job.id } });
+
+    // Mark release as SCHEDULED
+    await prisma.release.update({ where: { id: release.id }, data: { status: 'SCHEDULED' } });
+
+    res.status(201).json({ message: 'Release scheduled', scheduled: { ...scheduled, jobId: job.id } });
+  } catch (err) {
+    log.error({ error: err.message }, 'Failed to schedule release');
+    res.status(400).json({ error: err.message });
+  }
+});
+
+// POST /api/releases/:id/schedule/cancel — cancel a pending scheduled deployment
+router.post('/:id/schedule/cancel', async (req, res) => {
+  try {
+    const release = await prisma.release.findUnique({ where: { id: req.params.id } });
+    if (!release) return res.status(404).json({ error: 'Release not found' });
+
+    const scheduled = await prisma.scheduledDeployment.findUnique({ where: { releaseId: release.id } });
+    if (!scheduled) return res.status(404).json({ error: 'No scheduled deployment found for this release' });
+    if (scheduled.executed) return res.status(400).json({ error: 'Scheduled deployment already executed' });
+    if (scheduled.cancelledAt) return res.status(400).json({ error: 'Scheduled deployment already cancelled' });
+
+    // Remove job from queue if exists
+    if (scheduled.jobId) {
+      try {
+        const job = await deploymentQueue.getJob(scheduled.jobId);
+        if (job) await job.remove();
+      } catch (e) {
+        // ignore
+      }
+    }
+
+    await prisma.scheduledDeployment.update({ where: { id: scheduled.id }, data: { cancelledAt: new Date() } });
+    await prisma.release.update({ where: { id: release.id }, data: { status: 'PENDING' } });
+
+    res.json({ message: 'Scheduled deployment cancelled' });
+  } catch (err) {
+    log.error({ error: err.message }, 'Failed to cancel scheduled deployment');
+    res.status(400).json({ error: err.message });
   }
 });
 
