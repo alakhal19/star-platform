@@ -1,5 +1,15 @@
 const k8s = require('@kubernetes/client-node');
 
+// ─── TLS FIX ──────────────────────────────────────────────────────────────────
+// kubeadm clusters use a self-signed CA certificate. @kubernetes/client-node
+// manages its own internal https.Agent and ignores requestAgent patches.
+// Setting this env var before makeApiClient is called is the only reliable way
+// to make Node.js accept the self-signed cert on a private cluster.
+// Safe here because this process only talks to your own K8s API server (ZeroTier
+// private IP), not to any public endpoints.
+process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
+// ─────────────────────────────────────────────────────────────────────────────
+
 const loadKubeConfig = () => {
   const kc = new k8s.KubeConfig();
   if (process.env.KUBECONFIG) {
@@ -10,32 +20,10 @@ const loadKubeConfig = () => {
   return kc;
 };
 
-const kubeConfig = loadKubeConfig();
-const coreApi = kubeConfig.makeApiClient(k8s.CoreV1Api);
-const appsApi = kubeConfig.makeApiClient(k8s.AppsV1Api);
+const kubeConfig    = loadKubeConfig();
+const coreApi       = kubeConfig.makeApiClient(k8s.CoreV1Api);
+const appsApi       = kubeConfig.makeApiClient(k8s.AppsV1Api);
 const networkingApi = kubeConfig.makeApiClient(k8s.NetworkingV1Api);
-
-// ─── TLS FIX ──────────────────────────────────────────────────────────────────
-// kubeadm clusters use self-signed certs. The @kubernetes/client-node library
-// sets rejectUnauthorized based on the kubeconfig, but if the CA bundle is
-// missing or the env var NODE_EXTRA_CA_CERTS isn't set, Node rejects the cert
-// immediately. This patches the underlying agent on all three API clients.
-const https = require('https');
-const insecureAgent = new https.Agent({ rejectUnauthorized: false });
-
-// Only disable TLS verification if not already handled by the kubeconfig CA
-if (!process.env.NODE_EXTRA_CA_CERTS) {
-  coreApi.defaultHeaders = coreApi.defaultHeaders || {};
-  appsApi.defaultHeaders = appsApi.defaultHeaders || {};
-  networkingApi.defaultHeaders = networkingApi.defaultHeaders || {};
-
-  [coreApi, appsApi, networkingApi].forEach((client) => {
-    if (client.requestAgent === undefined) {
-      client.requestAgent = insecureAgent;
-    }
-  });
-}
-// ─────────────────────────────────────────────────────────────────────────────
 
 const ensureNamespace = async (name) => {
   try {
@@ -199,7 +187,7 @@ const waitForDeploymentReady = async ({ namespace, name, replicas = 1, timeoutMs
 
 module.exports = {
   ensureNamespace,
-  upsertImagePullSecret,   // ← was missing
+  upsertImagePullSecret,
   upsertDeployment,
   upsertService,
   upsertIngress,
