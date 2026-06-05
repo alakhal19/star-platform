@@ -7,6 +7,27 @@ const { deploymentQueue } = require('../../shared/queue/queue');
 const router = express.Router();
 const log = createModuleLogger('releases');
 
+// ─── IMAGE VALIDATION ─────────────────────────────────────────────────────────
+// Rejects images that are not fully qualified (e.g. "test/backend", "myimage").
+// A valid image must reference a registry with a dot in the host, e.g.:
+//   ghcr.io/alakhal19/erp-backend:latest
+//   docker.io/library/nginx:1.25
+// This prevents fake/test payloads from being stored and causing ErrImagePull.
+const VALID_REGISTRY_IMAGE = /^[a-zA-Z0-9._\-]+\.[a-zA-Z]{2,}(:[0-9]+)?\/[a-zA-Z0-9._\-/]+(:[a-zA-Z0-9._\-]+)?$/;
+
+const validateImage = (image, fieldName) => {
+  if (!image || typeof image !== 'string' || !image.trim()) {
+    throw new Error(`${fieldName} is required and must be a non-empty string`);
+  }
+  if (!VALID_REGISTRY_IMAGE.test(image.trim())) {
+    throw new Error(
+      `${fieldName} "${image}" is not a valid fully-qualified image. ` +
+      `Expected format: registry.host/owner/name:tag (e.g. ghcr.io/alakhal19/erp-backend:latest)`
+    );
+  }
+};
+// ─────────────────────────────────────────────────────────────────────────────
+
 // ─── WEBHOOK (no user auth, uses webhook secret) ─────────
 
 // POST /api/releases/webhook — receive from GitHub Actions
@@ -19,8 +40,18 @@ router.post('/webhook', authenticateWebhook, async (req, res) => {
     } = req.body;
 
     if (!version || !commit || !backendImage || !frontendImage) {
-      return res.status(400).json({ error: 'Missing required fields' });
+      return res.status(400).json({ error: 'Missing required fields: version, commit, backendImage, frontendImage' });
     }
+
+    // ── Validate images are fully qualified registry references ──────────────
+    try {
+      validateImage(backendImage,  'backendImage');
+      validateImage(frontendImage, 'frontendImage');
+    } catch (validationErr) {
+      log.warn({ backendImage, frontendImage, error: validationErr.message }, 'Webhook rejected: invalid image reference');
+      return res.status(400).json({ error: validationErr.message });
+    }
+    // ─────────────────────────────────────────────────────────────────────────
 
     // Find the project by repository
     let project = await prisma.project.findFirst({
@@ -75,8 +106,8 @@ router.post('/webhook', authenticateWebhook, async (req, res) => {
         commit,
         message: message || `Release ${version}`,
         author: author || 'unknown',
-        backendImage,
-        frontendImage,
+        backendImage:  backendImage.trim(),
+        frontendImage: frontendImage.trim(),
         filesChanged: fetchedFiles,
         additions: totalAdditions,
         deletions: totalDeletions,
@@ -89,6 +120,8 @@ router.post('/webhook', authenticateWebhook, async (req, res) => {
       version,
       commit: commit.slice(0, 7),
       author,
+      backendImage,
+      frontendImage,
     }, 'New release registered via webhook — awaiting approval');
 
     // Send approval notification email
@@ -283,7 +316,6 @@ router.get('/compare/:fromId/:toId', async (req, res) => {
   }
 });
 
-
 // GET /api/releases/:id/diff — get file diff from GitHub
 router.get('/:id/diff', async (req, res) => {
   try {
@@ -296,7 +328,6 @@ router.get('/:id/diff', async (req, res) => {
       return res.status(404).json({ error: 'Release not found' });
     }
 
-    // If we already have files stored, return them
     if (release.filesChanged) {
       return res.json({
         version: release.version,
@@ -307,7 +338,6 @@ router.get('/:id/diff', async (req, res) => {
       });
     }
 
-    // Otherwise fetch from GitHub
     const githubService = require('../../shared/github/github.service');
     const [owner, repo] = release.project.repository.split('/');
     const commitData = await githubService.getCommitFiles(owner, repo, release.commit);
@@ -316,7 +346,6 @@ router.get('/:id/diff', async (req, res) => {
       return res.status(404).json({ error: 'Could not fetch diff from GitHub' });
     }
 
-    // Save the files for next time
     await prisma.release.update({
       where: { id: release.id },
       data: {
@@ -351,7 +380,6 @@ router.get('/:id/compare', async (req, res) => {
       return res.status(404).json({ error: 'Release not found' });
     }
 
-    // Find the currently deployed release
     const currentLive = await prisma.release.findFirst({
       where: {
         projectId: release.projectId,
@@ -370,7 +398,6 @@ router.get('/:id/compare', async (req, res) => {
       });
     }
 
-    // Compare on GitHub
     const githubService = require('../../shared/github/github.service');
     const [owner, repo] = release.project.repository.split('/');
     const comparison = await githubService.compareCommits(
@@ -404,13 +431,11 @@ router.post('/:id/schedule', async (req, res) => {
     const release = await prisma.release.findUnique({ where: { id: req.params.id } });
     if (!release) return res.status(404).json({ error: 'Release not found' });
 
-    // Prevent double-scheduling for an already pending schedule
     const existing = await prisma.scheduledDeployment.findUnique({ where: { releaseId: release.id } });
     if (existing && !existing.cancelledAt && !existing.executed) {
       return res.status(400).json({ error: 'Release already scheduled' });
     }
 
-    // Create or refresh a scheduled deployment record if a previous schedule exists
     const scheduled = await prisma.scheduledDeployment.upsert({
       where: { releaseId: release.id },
       create: {
@@ -429,7 +454,6 @@ router.post('/:id/schedule', async (req, res) => {
       },
     });
 
-    // Add delayed job to deployment queue
     const delay = when.getTime() - Date.now();
 
     const job = await deploymentQueue.add(
@@ -438,10 +462,7 @@ router.post('/:id/schedule', async (req, res) => {
       { delay, jobId: `scheduled-${release.id}-${Date.now()}` }
     );
 
-    // Store jobId on scheduled record
     await prisma.scheduledDeployment.update({ where: { id: scheduled.id }, data: { jobId: job.id } });
-
-    // Mark release as SCHEDULED
     await prisma.release.update({ where: { id: release.id }, data: { status: 'SCHEDULED' } });
 
     res.status(201).json({ message: 'Release scheduled', scheduled: { ...scheduled, jobId: job.id } });
@@ -462,7 +483,6 @@ router.post('/:id/schedule/cancel', async (req, res) => {
     if (scheduled.executed) return res.status(400).json({ error: 'Scheduled deployment already executed' });
     if (scheduled.cancelledAt) return res.status(400).json({ error: 'Scheduled deployment already cancelled' });
 
-    // Remove job from queue if exists
     if (scheduled.jobId) {
       try {
         const job = await deploymentQueue.getJob(scheduled.jobId);
