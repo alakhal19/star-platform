@@ -1,13 +1,19 @@
 const k8s = require('@kubernetes/client-node');
 
 // ─── TLS FIX ──────────────────────────────────────────────────────────────────
-// kubeadm clusters use a self-signed CA certificate. @kubernetes/client-node
-// manages its own internal https.Agent and ignores requestAgent patches.
-// Setting this env var before makeApiClient is called is the only reliable way
-// to make Node.js accept the self-signed cert on a private cluster.
-// Safe here because this process only talks to your own K8s API server (ZeroTier
-// private IP), not to any public endpoints.
 process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
+// ─────────────────────────────────────────────────────────────────────────────
+
+// ─── ERROR UNWRAPPER ──────────────────────────────────────────────────────────
+const unwrapK8sError = (err) => {
+  if (err?.body?.message) {
+    const wrapped = new Error(err.body.message);
+    wrapped.statusCode = err.body.code || err.statusCode;
+    wrapped.reason = err.body.reason;
+    return wrapped;
+  }
+  return err;
+};
 // ─────────────────────────────────────────────────────────────────────────────
 
 const loadKubeConfig = () => {
@@ -28,13 +34,12 @@ const networkingApi = kubeConfig.makeApiClient(k8s.NetworkingV1Api);
 const ensureNamespace = async (name) => {
   try {
     await coreApi.readNamespace(name);
-    return;
   } catch (err) {
     if (err.statusCode === 404 || err.response?.statusCode === 404) {
       await coreApi.createNamespace({ metadata: { name } });
       return;
     }
-    throw err;
+    throw unwrapK8sError(err);
   }
 };
 
@@ -67,11 +72,15 @@ const upsertImagePullSecret = async ({ namespace, name, server, username, passwo
     if (err.statusCode === 404 || err.response?.statusCode === 404) {
       return await coreApi.createNamespacedSecret(namespace, secret);
     }
-    throw err;
+    throw unwrapK8sError(err);
   }
 };
 
 const upsertDeployment = async ({ namespace, name, image, containerPort, labels, env = [], replicas = 1, imagePullSecrets = [] }) => {
+  if (!image) {
+    throw new Error(`upsertDeployment: "image" is required for deployment "${name}" but received: ${JSON.stringify(image)}`);
+  }
+
   const deployment = {
     apiVersion: 'apps/v1',
     kind: 'Deployment',
@@ -104,7 +113,7 @@ const upsertDeployment = async ({ namespace, name, image, containerPort, labels,
     if (err.statusCode === 404 || err.response?.statusCode === 404) {
       return await appsApi.createNamespacedDeployment(namespace, deployment);
     }
-    throw err;
+    throw unwrapK8sError(err);
   }
 };
 
@@ -126,7 +135,7 @@ const upsertService = async ({ namespace, name, selector, port, targetPort }) =>
     if (err.statusCode === 404 || err.response?.statusCode === 404) {
       return await coreApi.createNamespacedService(namespace, service);
     }
-    throw err;
+    throw unwrapK8sError(err);
   }
 };
 
@@ -163,7 +172,7 @@ const upsertIngress = async ({ namespace, name, ingressClassName, rules, annotat
     if (err.statusCode === 404 || err.response?.statusCode === 404) {
       return await networkingApi.createNamespacedIngress(namespace, ingress);
     }
-    throw err;
+    throw unwrapK8sError(err);
   }
 };
 
@@ -172,17 +181,21 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const waitForDeploymentReady = async ({ namespace, name, replicas = 1, timeoutMs = 120000 }) => {
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
-    const response = await appsApi.readNamespacedDeployment(name, namespace);
-    const status = response.body.status || {};
-    if (
-      (status.availableReplicas || 0) >= replicas &&
-      (status.observedGeneration || 0) >= (response.body.metadata?.generation || 0)
-    ) {
-      return response.body;
+    try {
+      const response = await appsApi.readNamespacedDeployment(name, namespace);
+      const status = response.body.status || {};
+      if (
+        (status.availableReplicas || 0) >= replicas &&
+        (status.observedGeneration || 0) >= (response.body.metadata?.generation || 0)
+      ) {
+        return response.body;
+      }
+    } catch (err) {
+      throw unwrapK8sError(err);
     }
     await sleep(3000);
   }
-  throw new Error(`Deployment ${name} in namespace ${namespace} did not become ready within ${timeoutMs}ms`);
+  throw new Error(`Deployment "${name}" in namespace "${namespace}" did not become ready within ${timeoutMs}ms`);
 };
 
 module.exports = {

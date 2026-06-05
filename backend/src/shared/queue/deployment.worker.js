@@ -58,19 +58,24 @@ const deploymentWorker = new Worker('deployments', async (job) => {
   const logs = [];
 
   try {
-    const namespace              = process.env.K8S_NAMESPACE             || 'erp';
-    const ingressClass           = process.env.K8S_INGRESS_CLASS         || 'nginx';
-    const ingressHost            = process.env.K8S_INGRESS_HOST          || 'localhost';
-    const imagePullSecretName    = process.env.K8S_IMAGE_PULL_SECRET_NAME || 'ghcr-image-pull';
-    const backendPort            = 5000;
-    const frontendPort           = 3000;
-    const backendName            = `erp-backend-${targetEnv.toLowerCase()}`;
-    const frontendName           = `erp-frontend-${targetEnv.toLowerCase()}`;
-    const backendLabels          = { app: 'erp-backend',  env: targetEnv.toLowerCase(), release: release.version };
-    const frontendLabels         = { app: 'erp-frontend', env: targetEnv.toLowerCase(), release: release.version };
-    const useImagePullSecret     = !!(process.env.GHCR_USERNAME && process.env.GHCR_TOKEN);
+    const namespace           = process.env.K8S_NAMESPACE              || 'erp';
+    const ingressClass        = process.env.K8S_INGRESS_CLASS          || 'nginx';
+    const ingressHost         = process.env.K8S_INGRESS_HOST           || 'localhost';
+    const imagePullSecretName = process.env.K8S_IMAGE_PULL_SECRET_NAME || 'ghcr-image-pull';
+    const backendPort         = 5000;
+    const frontendPort        = 3000;
+    const backendName         = `erp-backend-${targetEnv.toLowerCase()}`;
+    const frontendName        = `erp-frontend-${targetEnv.toLowerCase()}`;
+    const useImagePullSecret  = !!(process.env.GHCR_USERNAME && process.env.GHCR_TOKEN);
 
-    // ─── STEP 1: K8S_SETUP ──────────────────────────────────────────────────
+    // Kubernetes label values must be alphanumeric and may contain - _ .
+    // but cannot start/end with those characters. Sanitize the version string.
+    const safeVersion = release.version.replace(/[^a-zA-Z0-9\-_.]/g, '-').replace(/^[-_.]+|[-_.]+$/g, '');
+
+    const backendLabels  = { app: 'erp-backend',  env: targetEnv.toLowerCase(), release: safeVersion };
+    const frontendLabels = { app: 'erp-frontend', env: targetEnv.toLowerCase(), release: safeVersion };
+
+    // ─── STEP 1: K8S_SETUP ────────────────────────────────────────────────
     emitDeploymentEvent({
       type: 'step',
       releaseId: release.id,
@@ -81,13 +86,10 @@ const deploymentWorker = new Worker('deployments', async (job) => {
       percent: 5,
     });
 
-    // Ensure namespace exists
     await ensureNamespace(namespace);
     logs.push(`[${timestamp()}] Ensured namespace ${namespace}`);
     log.info({ namespace }, 'Namespace ensured');
 
-    // Upsert image pull secret — wrapped so an AlreadyExists or TLS error
-    // does not abort the whole deployment (secret may already be correct).
     if (useImagePullSecret) {
       try {
         await upsertImagePullSecret({
@@ -100,10 +102,8 @@ const deploymentWorker = new Worker('deployments', async (job) => {
         logs.push(`[${timestamp()}] Image pull secret "${imagePullSecretName}" upserted in namespace ${namespace}`);
         log.info({ imagePullSecretName, namespace }, 'Image pull secret upserted');
       } catch (secretErr) {
-        // Log and continue — if the secret already exists and is valid,
-        // the deployment will still succeed.
         log.warn(
-          { error: secretErr.message, statusCode: secretErr.statusCode ?? secretErr.response?.statusCode },
+          { error: secretErr.message, statusCode: secretErr.statusCode },
           'upsertImagePullSecret failed — continuing (secret may already exist)'
         );
         logs.push(`[${timestamp()}] WARN: Could not upsert image pull secret: ${secretErr.message} — continuing`);
@@ -112,9 +112,7 @@ const deploymentWorker = new Worker('deployments', async (job) => {
 
     await job.updateProgress({ step: 'K8S_SETUP', percent: 10 });
 
-    // ─── STEP 2: K8S_DEPLOY ─────────────────────────────────────────────────
-
-    // Backend deployment + service
+    // ─── STEP 2: K8S_DEPLOY ───────────────────────────────────────────────
     await upsertDeployment({
       namespace,
       name: backendName,
@@ -138,7 +136,6 @@ const deploymentWorker = new Worker('deployments', async (job) => {
     });
     logs.push(`[${timestamp()}] Backend service "${backendName}" created`);
 
-    // Frontend deployment + service
     await upsertDeployment({
       namespace,
       name: frontendName,
@@ -162,7 +159,6 @@ const deploymentWorker = new Worker('deployments', async (job) => {
     });
     logs.push(`[${timestamp()}] Frontend service "${frontendName}" created`);
 
-    // Ingress
     await upsertIngress({
       namespace,
       name: 'erp-ingress',
@@ -188,8 +184,7 @@ const deploymentWorker = new Worker('deployments', async (job) => {
     });
     await job.updateProgress({ step: 'K8S_DEPLOY', percent: 40 });
 
-    // ─── STEP 3: K8S_HEALTH ─────────────────────────────────────────────────
-
+    // ─── STEP 3: K8S_HEALTH ───────────────────────────────────────────────
     await waitForDeploymentReady({ namespace, name: backendName,  replicas: 1, timeoutMs: 120000 });
     logs.push(`[${timestamp()}] Backend deployment "${backendName}" is ready`);
 
@@ -223,7 +218,7 @@ const deploymentWorker = new Worker('deployments', async (job) => {
     logs.push(`[${timestamp()}] Health check passed via ingress: ${healthResult.status}`);
     await job.updateProgress({ step: 'K8S_HEALTH', percent: 70 });
 
-    // ─── STEP 4: SWITCHING_TRAFFIC ──────────────────────────────────────────
+    // ─── STEP 4: SWITCHING_TRAFFIC ────────────────────────────────────────
     await job.updateProgress({ step: 'SWITCHING_TRAFFIC', percent: 80 });
     await updateDeploymentStatus(deployment.id, 'SWITCHING_TRAFFIC');
     logs.push(`[${timestamp()}] Switching traffic to ${targetEnv}...`);
@@ -242,7 +237,7 @@ const deploymentWorker = new Worker('deployments', async (job) => {
     logs.push(`[${timestamp()}] Traffic switched to ${targetEnv}`);
     await job.updateProgress({ step: 'SWITCHING_TRAFFIC', percent: 90 });
 
-    // ─── STEP 5: FINALIZE ───────────────────────────────────────────────────
+    // ─── STEP 5: FINALIZE ─────────────────────────────────────────────────
     const duration = Date.now() - startTime;
 
     await prisma.systemConfig.upsert({
@@ -307,14 +302,10 @@ const deploymentWorker = new Worker('deployments', async (job) => {
     return { success: true, environment: targetEnv, duration, logs: logs.join('\n') };
 
   } catch (err) {
-    // ─── DEPLOYMENT FAILED ──────────────────────────────────────────────────
     const duration = Date.now() - startTime;
     logs.push(`[${timestamp()}] ERROR: ${err.message}`);
 
-    log.error(
-      { releaseId: release.id, version: release.version, error: err.message, duration },
-      'Deployment failed'
-    );
+    log.error({ releaseId: release.id, version: release.version, error: err.message, duration }, 'Deployment failed');
 
     await prisma.deployment.update({
       where: { id: deployment.id },
@@ -358,7 +349,7 @@ const deploymentWorker = new Worker('deployments', async (job) => {
   concurrency: 1,
 });
 
-// ─── HELPERS ────────────────────────────────────────────────────────────────
+// ─── HELPERS ──────────────────────────────────────────────────────────────────
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -371,7 +362,7 @@ const updateDeploymentStatus = async (id, status) => {
   });
 };
 
-// ─── WORKER EVENTS ──────────────────────────────────────────────────────────
+// ─── WORKER EVENTS ────────────────────────────────────────────────────────────
 
 deploymentWorker.on('completed', (job) => {
   log.info({ jobId: job.id }, 'Deployment job finished');
