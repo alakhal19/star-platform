@@ -68,12 +68,17 @@ const deploymentWorker = new Worker('deployments', async (job) => {
     const frontendName        = `erp-frontend-${targetEnv.toLowerCase()}`;
     const useImagePullSecret  = !!(process.env.GHCR_USERNAME && process.env.GHCR_TOKEN);
 
-    // Kubernetes label values must be alphanumeric and may contain - _ .
-    // but cannot start/end with those characters. Sanitize the version string.
-    const safeVersion = release.version.replace(/[^a-zA-Z0-9\-_.]/g, '-').replace(/^[-_.]+|[-_.]+$/g, '');
+    // Sanitize version for Kubernetes label value
+    const safeVersion = release.version
+      .replace(/[^a-zA-Z0-9\-_.]/g, '-')
+      .replace(/^[-_.]+|[-_.]+$/g, '');
 
-    const backendLabels  = { app: 'erp-backend',  env: targetEnv.toLowerCase(), release: safeVersion };
-    const frontendLabels = { app: 'erp-frontend', env: targetEnv.toLowerCase(), release: safeVersion };
+    // selectorLabels: stable, immutable — used for spec.selector.matchLabels
+    // podLabels: includes version — used only on pod template metadata
+    const backendSelectorLabels  = { app: 'erp-backend',  env: targetEnv.toLowerCase() };
+    const frontendSelectorLabels = { app: 'erp-frontend', env: targetEnv.toLowerCase() };
+    const backendPodLabels       = { ...backendSelectorLabels,  release: safeVersion };
+    const frontendPodLabels      = { ...frontendSelectorLabels, release: safeVersion };
 
     // ─── STEP 1: K8S_SETUP ────────────────────────────────────────────────
     emitDeploymentEvent({
@@ -99,7 +104,7 @@ const deploymentWorker = new Worker('deployments', async (job) => {
           username: process.env.GHCR_USERNAME,
           password: process.env.GHCR_TOKEN,
         });
-        logs.push(`[${timestamp()}] Image pull secret "${imagePullSecretName}" upserted in namespace ${namespace}`);
+        logs.push(`[${timestamp()}] Image pull secret "${imagePullSecretName}" upserted`);
         log.info({ imagePullSecretName, namespace }, 'Image pull secret upserted');
       } catch (secretErr) {
         log.warn(
@@ -118,7 +123,8 @@ const deploymentWorker = new Worker('deployments', async (job) => {
       name: backendName,
       image: release.backendImage,
       containerPort: backendPort,
-      labels: backendLabels,
+      selectorLabels: backendSelectorLabels,
+      podLabels: backendPodLabels,
       env: [
         { name: 'PORT',     value: `${backendPort}` },
         { name: 'NODE_ENV', value: 'production' },
@@ -130,7 +136,7 @@ const deploymentWorker = new Worker('deployments', async (job) => {
     await upsertService({
       namespace,
       name: backendName,
-      selector: backendLabels,
+      selector: backendSelectorLabels,
       port: backendPort,
       targetPort: backendPort,
     });
@@ -141,7 +147,8 @@ const deploymentWorker = new Worker('deployments', async (job) => {
       name: frontendName,
       image: release.frontendImage,
       containerPort: frontendPort,
-      labels: frontendLabels,
+      selectorLabels: frontendSelectorLabels,
+      podLabels: frontendPodLabels,
       env: [
         { name: 'NODE_ENV',    value: 'production' },
         { name: 'BACKEND_URL', value: `http://${backendName}:${backendPort}` },
@@ -153,7 +160,7 @@ const deploymentWorker = new Worker('deployments', async (job) => {
     await upsertService({
       namespace,
       name: frontendName,
-      selector: frontendLabels,
+      selector: frontendSelectorLabels,
       port: frontendPort,
       targetPort: frontendPort,
     });

@@ -76,7 +76,17 @@ const upsertImagePullSecret = async ({ namespace, name, server, username, passwo
   }
 };
 
-const upsertDeployment = async ({ namespace, name, image, containerPort, labels, env = [], replicas = 1, imagePullSecrets = [] }) => {
+const upsertDeployment = async ({
+  namespace,
+  name,
+  image,
+  containerPort,
+  selectorLabels,   // used for spec.selector.matchLabels — immutable, no version
+  podLabels,        // used for pod template metadata — can include version label
+  env = [],
+  replicas = 1,
+  imagePullSecrets = [],
+}) => {
   if (!image) {
     throw new Error(`upsertDeployment: "image" is required for deployment "${name}" but received: ${JSON.stringify(image)}`);
   }
@@ -84,12 +94,12 @@ const upsertDeployment = async ({ namespace, name, image, containerPort, labels,
   const deployment = {
     apiVersion: 'apps/v1',
     kind: 'Deployment',
-    metadata: { name, namespace, labels },
+    metadata: { name, namespace, labels: podLabels },
     spec: {
       replicas,
-      selector: { matchLabels: labels },
+      selector: { matchLabels: selectorLabels },   // ← immutable, stable labels only
       template: {
-        metadata: { labels },
+        metadata: { labels: podLabels },            // ← can include release version
         spec: {
           imagePullSecrets,
           containers: [
