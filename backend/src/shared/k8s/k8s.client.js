@@ -208,11 +208,50 @@ const waitForDeploymentReady = async ({ namespace, name, replicas = 1, timeoutMs
   throw new Error(`Deployment "${name}" in namespace "${namespace}" did not become ready within ${timeoutMs}ms`);
 };
 
+const deleteDeployment = async ({ namespace, name }) => {
+  try {
+    await appsApi.readNamespacedDeployment(name, namespace);
+    return await appsApi.deleteNamespacedDeployment(name, namespace);
+  } catch (err) {
+    if (err.statusCode === 404 || err.response?.statusCode === 404) {
+      return null; // already gone
+    }
+    throw unwrapK8sError(err);
+  }
+};
+
+const deleteService = async ({ namespace, name }) => {
+  try {
+    await coreApi.readNamespacedService(name, namespace);
+    return await coreApi.deleteNamespacedService(name, namespace);
+  } catch (err) {
+    if (err.statusCode === 404 || err.response?.statusCode === 404) {
+      return null;
+    }
+    throw unwrapK8sError(err);
+  }
+};
+
+const deleteIngress = async ({ namespace, name }) => {
+  try {
+    await networkingApi.readNamespacedIngress(name, namespace);
+    return await networkingApi.deleteNamespacedIngress(name, namespace);
+  } catch (err) {
+    if (err.statusCode === 404 || err.response?.statusCode === 404) {
+      return null;
+    }
+    throw unwrapK8sError(err);
+  }
+};
+
 module.exports = {
   ensureNamespace,
   upsertImagePullSecret,
   upsertDeployment,
   upsertService,
   upsertIngress,
+  deleteDeployment,
+  deleteService,
+  deleteIngress,
   waitForDeploymentReady,
 };

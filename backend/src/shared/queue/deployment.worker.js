@@ -10,6 +10,9 @@ const {
   upsertDeployment,
   upsertService,
   upsertIngress,
+  deleteDeployment,
+  deleteService,
+  deleteIngress,
   waitForDeploymentReady,
 } = require('../k8s/k8s.client');
 
@@ -56,29 +59,30 @@ const deploymentWorker = new Worker('deployments', async (job) => {
 
   const startTime = Date.now();
   const logs = [];
+  // K8s / deployment configuration (computed before try so rollback can reuse)
+  const namespace           = process.env.K8S_NAMESPACE              || 'erp';
+  const ingressClass        = process.env.K8S_INGRESS_CLASS          || 'nginx';
+  const ingressHost         = process.env.K8S_INGRESS_HOST           || 'localhost';
+  const imagePullSecretName = process.env.K8S_IMAGE_PULL_SECRET_NAME || 'ghcr-image-pull';
+  const backendPort         = 5000;
+  const frontendPort        = 3000;
+  const backendName         = `erp-backend-${targetEnv.toLowerCase()}`;
+  const frontendName        = `erp-frontend-${targetEnv.toLowerCase()}`;
+  const useImagePullSecret  = !!(process.env.GHCR_USERNAME && process.env.GHCR_TOKEN);
+
+  // Sanitize version for Kubernetes label value
+  const safeVersion = release.version
+    .replace(/[^a-zA-Z0-9\-_.]/g, '-')
+    .replace(/^[-_.]+|[-_.]+$/g, '');
+
+  // selectorLabels: stable, immutable — used for spec.selector.matchLabels
+  // podLabels: includes version — used only on pod template metadata
+  const backendSelectorLabels  = { app: 'erp-backend',  env: targetEnv.toLowerCase() };
+  const frontendSelectorLabels = { app: 'erp-frontend', env: targetEnv.toLowerCase() };
+  const backendPodLabels       = { ...backendSelectorLabels,  release: safeVersion };
+  const frontendPodLabels      = { ...frontendSelectorLabels, release: safeVersion };
 
   try {
-    const namespace           = process.env.K8S_NAMESPACE              || 'erp';
-    const ingressClass        = process.env.K8S_INGRESS_CLASS          || 'nginx';
-    const ingressHost         = process.env.K8S_INGRESS_HOST           || 'localhost';
-    const imagePullSecretName = process.env.K8S_IMAGE_PULL_SECRET_NAME || 'ghcr-image-pull';
-    const backendPort         = 5000;
-    const frontendPort        = 3000;
-    const backendName         = `erp-backend-${targetEnv.toLowerCase()}`;
-    const frontendName        = `erp-frontend-${targetEnv.toLowerCase()}`;
-    const useImagePullSecret  = !!(process.env.GHCR_USERNAME && process.env.GHCR_TOKEN);
-
-    // Sanitize version for Kubernetes label value
-    const safeVersion = release.version
-      .replace(/[^a-zA-Z0-9\-_.]/g, '-')
-      .replace(/^[-_.]+|[-_.]+$/g, '');
-
-    // selectorLabels: stable, immutable — used for spec.selector.matchLabels
-    // podLabels: includes version — used only on pod template metadata
-    const backendSelectorLabels  = { app: 'erp-backend',  env: targetEnv.toLowerCase() };
-    const frontendSelectorLabels = { app: 'erp-frontend', env: targetEnv.toLowerCase() };
-    const backendPodLabels       = { ...backendSelectorLabels,  release: safeVersion };
-    const frontendPodLabels      = { ...frontendSelectorLabels, release: safeVersion };
 
     // ─── STEP 1: K8S_SETUP ────────────────────────────────────────────────
     emitDeploymentEvent({
@@ -349,6 +353,26 @@ const deploymentWorker = new Worker('deployments', async (job) => {
       error: err.message,
     });
 
+    // Optionally perform automatic rollback to previous environment
+    if (process.env.ROLLBACK_ON_FAILURE === 'true') {
+      try {
+        await performRollback({
+          previousEnv: currentEnv,
+          targetEnvParam: targetEnv,
+          releaseObj: release,
+          deploymentObj: deployment,
+          logsRef: logs,
+          namespaceParam: namespace,
+          ingressClassParam: ingressClass,
+          backendPortParam: backendPort,
+          frontendPortParam: frontendPort,
+          keepFailedResources: process.env.KEEP_FAILED_RESOURCES === 'true',
+        });
+      } catch (rbErr) {
+        log.error({ error: rbErr.message }, 'Automatic rollback failed');
+      }
+    }
+
     throw err;
   }
 }, {
@@ -369,6 +393,87 @@ const updateDeploymentStatus = async (id, status) => {
   });
 };
 
+// Perform rollback: point ingress back to previous env, revert active_environment, and optionally remove failed resources
+const performRollback = async ({
+  previousEnv,
+  targetEnvParam,
+  releaseObj,
+  deploymentObj,
+  logsRef = [],
+  namespaceParam = namespace,
+  ingressClassParam = ingressClass,
+  backendPortParam = backendPort,
+  frontendPortParam = frontendPort,
+  keepFailedResources = false,
+}) => {
+  const prevBackendName = `erp-backend-${previousEnv.toLowerCase()}`;
+  const prevFrontendName = `erp-frontend-${previousEnv.toLowerCase()}`;
+  const failedBackendName = `erp-backend-${targetEnvParam.toLowerCase()}`;
+  const failedFrontendName = `erp-frontend-${targetEnvParam.toLowerCase()}`;
+
+  emitDeploymentEvent({
+    type: 'rollback',
+    version: releaseObj?.version,
+    message: `Rolling back traffic to ${previousEnv}`,
+    percent: 0,
+  });
+
+  try {
+    await upsertIngress({
+      namespace: namespaceParam,
+      name: 'erp-ingress',
+      ingressClassName: ingressClassParam,
+      annotations: { 'nginx.ingress.kubernetes.io/rewrite-target': '/$1' },
+      rules: [
+        { path: '/api', serviceName: prevBackendName,  servicePort: backendPortParam  },
+        { path: '/',    serviceName: prevFrontendName, servicePort: frontendPortParam },
+      ],
+    });
+    logsRef.push(`[${timestamp()}] Ingress reverted to ${previousEnv}`);
+
+    await prisma.systemConfig.upsert({
+      where: { key: 'active_environment' },
+      update: { value: previousEnv },
+      create: { key: 'active_environment', value: previousEnv },
+    });
+    logsRef.push(`[${timestamp()}] active_environment set to ${previousEnv}`);
+
+    if (!keepFailedResources) {
+      try {
+        await deleteDeployment({ namespace: namespaceParam, name: failedBackendName });
+        await deleteService({ namespace: namespaceParam, name: failedBackendName });
+        await deleteDeployment({ namespace: namespaceParam, name: failedFrontendName });
+        await deleteService({ namespace: namespaceParam, name: failedFrontendName });
+        logsRef.push(`[${timestamp()}] Removed failed resources for ${targetEnvParam}`);
+      } catch (e) {
+        log.warn({ error: e.message }, 'Failed to remove failed resources during rollback');
+        logsRef.push(`[${timestamp()}] WARN: Failed to remove failed resources: ${e.message}`);
+      }
+    }
+
+    if (deploymentObj?.id) {
+      await prisma.deployment.update({
+        where: { id: deploymentObj.id },
+        data: { status: 'ROLLED_BACK', logs: logsRef.join('\n'), completedAt: new Date() },
+      });
+    }
+
+    emitDeploymentEvent({
+      type: 'rolled_back',
+      version: releaseObj?.version,
+      message: `Rolled back to ${previousEnv}`,
+      percent: 100,
+      environment: previousEnv,
+    });
+
+    log.info({ releaseId: releaseObj?.id, version: releaseObj?.version, rolledBackTo: previousEnv }, 'Rollback completed');
+    return { success: true, environment: previousEnv };
+  } catch (err) {
+    log.error({ error: err.message }, 'Rollback failed');
+    throw err;
+  }
+};
+
 // ─── WORKER EVENTS ────────────────────────────────────────────────────────────
 
 deploymentWorker.on('completed', (job) => {
@@ -380,3 +485,25 @@ deploymentWorker.on('failed', (job, err) => {
 });
 
 module.exports = deploymentWorker;
+
+// Callable from other modules (e.g. an API handler triggered by a UI button)
+module.exports.rollbackDeployment = async ({ releaseId, deploymentId, keepFailedResources = false }) => {
+  // Resolve release and current active environment
+  const releaseObj = await prisma.release.findUnique({ where: { id: releaseId } });
+  const deploymentObj = await prisma.deployment.findUnique({ where: { id: deploymentId } });
+  const config = await prisma.systemConfig.findUnique({ where: { key: 'active_environment' } });
+  const active = config?.value || 'BLUE';
+  const previousEnv = active === 'BLUE' ? 'GREEN' : 'BLUE';
+
+  // We create a fresh logs array for this manual rollback
+  const logsRef = [];
+
+  return performRollback({
+    previousEnv,
+    targetEnvParam: previousEnv === 'BLUE' ? 'GREEN' : 'BLUE',
+    releaseObj,
+    deploymentObj,
+    logsRef,
+    keepFailedResources,
+  });
+};
