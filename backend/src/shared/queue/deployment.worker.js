@@ -400,10 +400,10 @@ const performRollback = async ({
   releaseObj,
   deploymentObj,
   logsRef = [],
-  namespaceParam = process.env.K8S_NAMESPACE || 'erp',
-  ingressClassParam = ingressClass,
-  backendPortParam = backendPort,
-  frontendPortParam = frontendPort,
+  namespaceParam    = process.env.K8S_NAMESPACE     || 'erp',
+  ingressClassParam = process.env.K8S_INGRESS_CLASS || 'nginx',
+  backendPortParam  = 5000,
+  frontendPortParam = 3000,
   keepFailedResources = false,
 }) => {
   const prevBackendName = `erp-backend-${previousEnv.toLowerCase()}`;
