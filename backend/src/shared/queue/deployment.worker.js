@@ -400,7 +400,7 @@ const performRollback = async ({
   releaseObj,
   deploymentObj,
   logsRef = [],
-  namespaceParam = namespace,
+  namespaceParam = process.env.K8S_NAMESPACE || 'erp',
   ingressClassParam = ingressClass,
   backendPortParam = backendPort,
   frontendPortParam = frontendPort,
