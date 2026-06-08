@@ -46,6 +46,30 @@ router.get('/stream', (req, res) => {
 
 router.use(authenticate);
 
+// POST /api/deployments/:id/rollback — trigger rollback for a deployment
+router.post('/:id/rollback', async (req, res) => {
+  try {
+    const deployment = await prisma.deployment.findUnique({ where: { id: req.params.id } });
+    if (!deployment) return res.status(404).json({ error: 'Deployment not found' });
+
+    const { keepFailedResources } = req.body || {};
+
+    // Require user to have permission? For now, authenticated users can trigger rollback
+    const rollbackWorker = require('../../shared/queue/deployment.worker');
+
+    const result = await rollbackWorker.rollbackDeployment({
+      releaseId: deployment.releaseId,
+      deploymentId: deployment.id,
+      keepFailedResources: !!keepFailedResources,
+    });
+
+    res.json({ message: 'Rollback triggered', result });
+  } catch (err) {
+    log.error({ error: err.message }, 'Failed to trigger rollback');
+    res.status(400).json({ error: err.message });
+  }
+});
+
 // POST /api/deployments/trigger/:releaseId — start a deployment
 router.post('/trigger/:releaseId', async (req, res) => {
   try {

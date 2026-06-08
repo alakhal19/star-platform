@@ -79,6 +79,20 @@ export default function ReleaseDetailPage() {
     }
   };
 
+  const handleRollback = async () => {
+    // find the most recent failed deployment for this release
+    const failed = (release.deployments || []).find(d => d.status === 'FAILED');
+    if (!failed) return alert('No failed deployment to rollback');
+    if (!confirm('Roll back traffic to the previous environment?')) return;
+    try {
+      await api.post(`/deployments/${failed.id}/rollback`, { keepFailedResources: false });
+      fetchRelease();
+      alert('Rollback triggered');
+    } catch (err) {
+      alert(err.response?.data?.error || 'Rollback failed');
+    }
+  };
+
   const handleChangelog = async () => {
     setAiLoading('changelog');
     try {
@@ -135,6 +149,11 @@ export default function ReleaseDetailPage() {
             {['APPROVED', 'PENDING', 'FAILED', 'ROLLED_BACK'].includes(release.status) && (
               <button onClick={handleDeploy} className="text-xs font-medium px-3 py-1.5 rounded-lg bg-purple-500/10 text-purple-400 border border-purple-500/20 hover:bg-purple-500/20 transition-colors">
                 Deploy now
+              </button>
+            )}
+            {release.deployments && release.deployments.some(d => d.status === 'FAILED') && (
+              <button onClick={handleRollback} className="text-xs font-medium px-3 py-1.5 rounded-lg bg-red-500/10 text-red-400 border border-red-500/20 hover:bg-red-500/20 transition-colors">
+                Rollback
               </button>
             )}
           </div>
