@@ -155,7 +155,7 @@ const deploymentWorker = new Worker('deployments', async (job) => {
       podLabels: frontendPodLabels,
       env: [
         { name: 'NODE_ENV',    value: 'production' },
-        { name: 'BACKEND_URL', value: `http://${backendName}:${backendPort}` },
+        { name: 'BACKEND_URL', value: `http://backend-service:${backendPort}` },
       ],
       imagePullSecrets: useImagePullSecret ? [{ name: imagePullSecretName }] : [],
     });
