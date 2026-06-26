@@ -19,6 +19,7 @@ export default function DashboardPage() {
   const [releases, setReleases] = useState([]);
   const [loading, setLoading] = useState(true);
   const [events, setEvents] = useState([]);
+  const [streaming, setStreaming] = useState(false);
   const [showScheduleModal, setShowScheduleModal] = useState(false);
   const [scheduledRelease, setScheduledRelease] = useState(null);
   const [scheduledLocal, setScheduledLocal] = useState('');
@@ -34,6 +35,8 @@ export default function DashboardPage() {
   useEffect(() => {
     const eventSource = new EventSource('/api/deployments/stream');
 
+    eventSource.onopen = () => setStreaming(true);
+
     eventSource.onmessage = (e) => {
       try {
         const data = JSON.parse(e.data);
@@ -41,14 +44,16 @@ export default function DashboardPage() {
 
         setEvents((prev) => [data, ...prev].slice(0, 20));
 
-        // Refresh releases when a deployment completes
-        if (data.type === 'complete' || data.type === 'error') {
+        // Refresh releases when a deployment completes or fails
+        if (data.type === 'complete' || data.type === 'error' || data.type === 'rolled_back') {
           setTimeout(fetchReleases, 1000);
         }
       } catch (err) {
         // ignore parse errors
       }
     };
+
+    eventSource.onerror = () => setStreaming(false);
 
     return () => eventSource.close();
   }, []);
@@ -85,7 +90,6 @@ export default function DashboardPage() {
 
   const openSchedule = (release) => {
     setScheduledRelease(release);
-    // Pre-fill with 1 hour in future
     const d = new Date(Date.now() + 60 * 60 * 1000);
     const pad = (n) => n.toString().padStart(2, '0');
     const local = `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
@@ -98,7 +102,11 @@ export default function DashboardPage() {
     if (!scheduledLocal) return alert('Select date and time');
     const iso = new Date(scheduledLocal).toISOString();
     try {
-      await api.post(`/releases/${scheduledRelease.id}/schedule`, { scheduledFor: iso, timezone: Intl.DateTimeFormat().resolvedOptions().timeZone, reason: scheduleReason });
+      await api.post(`/releases/${scheduledRelease.id}/schedule`, {
+        scheduledFor: iso,
+        timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+        reason: scheduleReason,
+      });
       setShowScheduleModal(false);
       fetchReleases();
     } catch (err) {
@@ -116,16 +124,24 @@ export default function DashboardPage() {
     }
   };
 
-  const deployedCount = releases.filter((r) => r.status === 'DEPLOYED').length;
-  const failedCount = releases.filter((r) => r.status === 'FAILED').length;
-  const scheduledCount = releases.filter((r) => r.status === 'SCHEDULED').length;
+  const deployedCount   = releases.filter((r) => r.status === 'DEPLOYED').length;
+  const failedCount     = releases.filter((r) => r.status === 'FAILED').length;
+  const scheduledCount  = releases.filter((r) => r.status === 'SCHEDULED').length;
 
   const timeAgo = (date) => {
     const seconds = Math.floor((new Date() - new Date(date)) / 1000);
-    if (seconds < 60) return `${seconds}s ago`;
-    if (seconds < 3600) return `${Math.floor(seconds / 60)}m ago`;
+    if (seconds < 60)    return `${seconds}s ago`;
+    if (seconds < 3600)  return `${Math.floor(seconds / 60)}m ago`;
     if (seconds < 86400) return `${Math.floor(seconds / 3600)}h ago`;
     return `${Math.floor(seconds / 86400)}d ago`;
+  };
+
+  // Pick symbol and color per event type
+  const eventSymbol = (type) => {
+    if (type === 'complete')                          return { char: '✓', cls: 'text-green-400' };
+    if (type === 'error')                             return { char: '✗', cls: 'text-red-400' };
+    if (type === 'rollback' || type === 'rolled_back') return { char: '↩', cls: 'text-yellow-400' };
+    return { char: '>', cls: 'text-purple-400' };
   };
 
   if (loading) return <div className="p-8 text-gray-500">Loading releases...</div>;
@@ -189,15 +205,12 @@ export default function DashboardPage() {
         ) : (
           releases.map((release) => {
             const status = statusConfig[release.status] || statusConfig.PENDING;
-            const lastDeployment = release.deployments?.[0];
             return (
               <div
                 key={release.id}
                 className="grid grid-cols-[130px_1fr_90px_110px_80px_140px] px-5 py-3.5 border-b border-gray-800/10 items-center hover:bg-gray-800/5 transition-colors"
               >
-                <div className="font-mono text-sm text-purple-400 font-medium">
-                  {release.version}
-                </div>
+                <div className="font-mono text-sm text-purple-400 font-medium">{release.version}</div>
                 <div>
                   <p className="text-xs text-gray-400 truncate">{release.message}</p>
                   <p className="text-[10px] font-mono text-gray-700 mt-0.5">{release.commit?.slice(0, 7)}</p>
@@ -209,7 +222,9 @@ export default function DashboardPage() {
                     {release.status === 'DEPLOYED' ? 'LIVE' : release.status.replace('_', ' ')}
                   </span>
                   {release.status === 'SCHEDULED' && release.scheduledDeploy && (
-                    <div className="text-[10px] text-amber-300 mt-1">Scheduled: {new Date(release.scheduledDeploy.scheduledFor).toLocaleString()}</div>
+                    <div className="text-[10px] text-amber-300 mt-1">
+                      {new Date(release.scheduledDeploy.scheduledFor).toLocaleString()}
+                    </div>
                   )}
                 </div>
                 <div className="text-[11px] text-gray-600">{timeAgo(release.createdAt)}</div>
@@ -263,18 +278,39 @@ export default function DashboardPage() {
       {showScheduleModal && (
         <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50">
           <div className="bg-[#0f1423] rounded-xl p-6 w-[420px] border border-gray-800/20">
-            <h3 className="text-sm font-semibold text-gray-100 mb-3">Schedule deployment for {scheduledRelease?.version}</h3>
+            <h3 className="text-sm font-semibold text-gray-100 mb-3">
+              Schedule deployment for {scheduledRelease?.version}
+            </h3>
             <div className="mb-3">
               <label className="text-[11px] text-gray-400">Date & time</label>
-              <input type="datetime-local" value={scheduledLocal} onChange={(e) => setScheduledLocal(e.target.value)} className="w-full mt-1 p-2 rounded bg-gray-900 text-gray-100" />
+              <input
+                type="datetime-local"
+                value={scheduledLocal}
+                onChange={(e) => setScheduledLocal(e.target.value)}
+                className="w-full mt-1 p-2 rounded bg-gray-900 text-gray-100"
+              />
             </div>
             <div className="mb-4">
               <label className="text-[11px] text-gray-400">Reason (optional)</label>
-              <input value={scheduleReason} onChange={(e) => setScheduleReason(e.target.value)} className="w-full mt-1 p-2 rounded bg-gray-900 text-gray-100" />
+              <input
+                value={scheduleReason}
+                onChange={(e) => setScheduleReason(e.target.value)}
+                className="w-full mt-1 p-2 rounded bg-gray-900 text-gray-100"
+              />
             </div>
             <div className="flex justify-end gap-2">
-              <button onClick={() => setShowScheduleModal(false)} className="text-xs px-3 py-1 rounded bg-gray-800 text-gray-300">Cancel</button>
-              <button onClick={handleScheduleSubmit} className="text-xs px-3 py-1 rounded bg-amber-500 text-amber-900">Schedule</button>
+              <button
+                onClick={() => setShowScheduleModal(false)}
+                className="text-xs px-3 py-1 rounded bg-gray-800 text-gray-300"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={handleScheduleSubmit}
+                className="text-xs px-3 py-1 rounded bg-amber-500 text-amber-900"
+              >
+                Schedule
+              </button>
             </div>
           </div>
         </div>
@@ -284,8 +320,10 @@ export default function DashboardPage() {
       <div className="mb-4 flex items-center justify-between">
         <h2 className="text-sm font-semibold text-gray-300">Live deployment feed</h2>
         <div className="flex items-center gap-1.5">
-          <span className="w-1.5 h-1.5 rounded-full bg-green-400 animate-[pulse-dot_2s_infinite]" />
-          <span className="text-[10px] text-green-400 font-mono">STREAMING</span>
+          <span className={`w-1.5 h-1.5 rounded-full ${streaming ? 'bg-green-400 animate-[pulse-dot_2s_infinite]' : 'bg-red-500'}`} />
+          <span className={`text-[10px] font-mono ${streaming ? 'text-green-400' : 'text-red-400'}`}>
+            {streaming ? 'STREAMING' : 'DISCONNECTED'}
+          </span>
         </div>
       </div>
 
@@ -293,26 +331,25 @@ export default function DashboardPage() {
         {events.length === 0 ? (
           <p className="text-xs text-gray-700 font-mono text-center py-4">Waiting for deployment events...</p>
         ) : (
-          events.map((event, i) => (
-            <div key={i} className="flex items-start gap-3 py-1.5 font-mono text-xs">
-              <span className="text-gray-700 min-w-[55px]">
-                {event.timestamp ? new Date(event.timestamp).toLocaleTimeString('en-US', { hour12: false }) : '--:--:--'}
-              </span>
-              <span className={`min-w-[12px] text-center ${
-                event.type === 'complete' ? 'text-green-400' :
-                event.type === 'error' ? 'text-red-400' :
-                'text-purple-400'
-              }`}>
-                {event.type === 'complete' ? '+' : event.type === 'error' ? '!' : '>'}
-              </span>
-              <span className="text-gray-400">
-                {event.message}
-                {event.percent && (
-                  <span className="text-gray-700 ml-2">[{event.percent}%]</span>
-                )}
-              </span>
-            </div>
-          ))
+          events.map((event, i) => {
+            const { char, cls } = eventSymbol(event.type);
+            return (
+              <div key={i} className="flex items-start gap-3 py-1.5 font-mono text-xs">
+                <span className="text-gray-700 min-w-[55px]">
+                  {event.timestamp
+                    ? new Date(event.timestamp).toLocaleTimeString('en-US', { hour12: false })
+                    : '--:--:--'}
+                </span>
+                <span className={`min-w-[12px] text-center ${cls}`}>{char}</span>
+                <span className="text-gray-400">
+                  {event.message}
+                  {event.percent !== undefined && (
+                    <span className="text-gray-700 ml-2">[{event.percent}%]</span>
+                  )}
+                </span>
+              </div>
+            );
+          })
         )}
       </div>
     </div>
