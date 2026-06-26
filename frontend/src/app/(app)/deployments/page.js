@@ -25,8 +25,7 @@ export default function DeploymentsPage() {
     fetchDeployments();
 
     // EventSource connects to the backend SSE endpoint (no auth needed — route is public)
-    const backendUrl = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8001';
-    const es = new EventSource(`${backendUrl}/api/deployments/stream`);
+    const es = new EventSource('/api/deployments/stream');
     esRef.current = es;
 
     es.onopen = () => {
